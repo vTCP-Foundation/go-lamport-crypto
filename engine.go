@@ -1,93 +1,78 @@
 package crypto
 
 import (
-	"errors"
+	"crypto/rand"
 	"io/ioutil"
-	"os"
-	"os/exec"
-)
-
-const (
-	keysDir = "keys/"
-)
-
-var (
-	ErrKeypairAlreadyPresent = errors.New("key pair is already present")
 )
 
 type Lamport struct {
-	dir  string
-	name string
+	keysPoolPath   string
+	executablePath string
+	name           string
 }
 
-func NewLamport(operationName string) (scheme *Lamport, err error) {
-	dir, err := os.Getwd()
+func NewLamport(operationName string, keysPoolPath string) (scheme *Lamport, err error) {
+	normalizedKeysPoolPath, err := normalizeAndEnsureKeysPoolDir(keysPoolPath)
 	if err != nil {
-		return nil, err
+		return
 	}
-	dir += "/" + keysDir
+
+	executablePath, err := backendExecutable()
+	if err != nil {
+		return
+	}
 
 	scheme = &Lamport{
-		dir:  dir,
-		name: operationName,
+		executablePath: executablePath,
+		keysPoolPath:   normalizedKeysPoolPath,
+		name:           operationName,
 	}
 
 	return
 }
 
 func (scheme *Lamport) GenerateKeypair() (err error) {
-	pKeyPath := scheme.dir + scheme.name + ".pkey"
-	pubKeyPath := scheme.dir + scheme.name + ".pubkey"
-	if isFileExists(pKeyPath) || isFileExists(pubKeyPath) {
-		err = ErrKeypairAlreadyPresent
+	if isFileExists(scheme.pKeyFilePath()) || isFileExists(scheme.pKeyFilePath()) {
+		return ErrKeypairAlreadyPresent
+	}
+
+	err = scheme.execute("generate", scheme.name)
+	defer func() {
+		if err != nil {
+			// No files must be left in case of partial command execution.
+			tryRemove(scheme.pKeyFilePath())
+			tryRemove(scheme.pKeyFilePath())
+		}
+	}()
+
+	return err
+}
+
+func (scheme *Lamport) Sign(hash Hash) (err error) {
+	defer tryRemove(scheme.hashKeyFilePath())
+	err = ioutil.WriteFile(scheme.hashKeyFilePath(), hash[:], 0644)
+	if err != nil {
 		return
 	}
 
-	command := exec.Command("./lamportc", "generate", scheme.name)
-	command.Dir = scheme.dir
-
-	err = command.Run()
+	err = scheme.execute("sign", scheme.hashFileName(), scheme.pKeyFileName(), scheme.name)
 	if err != nil {
 		// No files must be left in case of partial command execution.
-		_ = os.Remove(pKeyPath)
-		_ = os.Remove(pubKeyPath)
-	}
-
-	return
-}
-
-func (scheme *Lamport) Sign(hash Hash) (sigFilename string, err error) {
-	hashFilename := scheme.name + ".bin"
-	_ = ioutil.WriteFile(scheme.dir+hashFilename, hash[:], 0644)
-	defer os.Remove(scheme.dir + hashFilename)
-
-	pKeyFilename := scheme.name + ".pkey"
-	sigFilename = scheme.name
-
-	command := exec.Command("./lamportc", "sign", hashFilename, pKeyFilename, sigFilename)
-	command.Dir = scheme.dir
-
-	err = command.Run()
-	if err != nil {
-		// No files must be left in case of partial command execution.
-		_ = os.Remove(scheme.dir + sigFilename)
+		tryRemove(scheme.sigKeyFilePath())
+		return
 	}
 
 	return
 }
 
 func (scheme *Lamport) Verify(hash Hash) (ok bool, err error) {
-	hashFilename := scheme.name + ".bin"
-	_ = ioutil.WriteFile(scheme.dir+hashFilename, hash[:], 0644)
-	defer os.Remove(scheme.dir + hashFilename)
+	defer tryRemove(scheme.hashKeyFilePath())
+	err = ioutil.WriteFile(scheme.hashKeyFilePath(), hash[:], 0644)
+	if err != nil {
+		return
+	}
 
-	pubKeyFilename := scheme.name + ".pubkey"
-	sigFilename := scheme.name + ".sig"
-
-	command := exec.Command("./lamportc", "verify", hashFilename, sigFilename, pubKeyFilename)
-	command.Dir = scheme.dir
-
-	err = command.Run()
+	err = scheme.execute("verify", scheme.hashFileName(), scheme.sigFileName(), scheme.pubKeyFileName())
 	if err != nil {
 		err = nil
 		ok = false
@@ -97,11 +82,25 @@ func (scheme *Lamport) Verify(hash Hash) (ok bool, err error) {
 	return
 }
 
-func isFileExists(filepath string) bool {
-	_, err := os.Stat(filepath)
-	if os.IsNotExist(err) {
-		return false
-	}
+func GenerateRandomHash() (h Hash, err error) {
+	_, err = rand.Read(h[:])
+	return
+}
 
-	return true
+func (scheme *Lamport) LoadPubKey() (pubKey *LamportPubKey, err error) {
+	pubKey = &LamportPubKey{}
+	err = readFileIntoBuffer(scheme.pubKeyFilePath(), pubKey[:], LamportPubKeySize)
+	return
+}
+
+func (scheme *Lamport) LoadPrivateKey() (pKey *LamportPKey, err error) {
+	pKey = &LamportPKey{}
+	err = readFileIntoBuffer(scheme.pKeyFilePath(), pKey[:], LamportPKeySize)
+	return
+}
+
+func (scheme *Lamport) LoadSignature() (sig *LamportSig, err error) {
+	sig = &LamportSig{}
+	err = readFileIntoBuffer(scheme.sigKeyFilePath(), sig[:], LamportSigSize)
+	return
 }
